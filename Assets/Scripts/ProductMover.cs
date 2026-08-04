@@ -66,6 +66,25 @@ public sealed class ProductMover : MonoBehaviour
         isPaused = false;
     }
 
+    public void ResetMovementState()
+    {
+        isMoving = false;
+        isPaused = false;
+        hasReachedTarget = false;
+
+        if (productRigidbody == null)
+        {
+            productRigidbody = GetComponent<Rigidbody>();
+        }
+
+        productRigidbody.linearVelocity = Vector3.zero;
+        productRigidbody.angularVelocity = Vector3.zero;
+        targetPosition = productRigidbody.position;
+        targetCoordinate = movementAxis == MovementAxis.X
+            ? targetPosition.x
+            : targetPosition.z;
+    }
+
     public bool ConsumeTargetReached()
     {
         if (!hasReachedTarget)

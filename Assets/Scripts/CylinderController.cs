@@ -60,6 +60,7 @@ public sealed class CylinderController : MonoBehaviour
         extendedLength = Vector3.Dot(
             cylinderExtendedPoint.position - fixedBodyEnd,
             extensionDirection);
+        state = CylinderState.Retracted;
     }
 
     public void BeginExtend()

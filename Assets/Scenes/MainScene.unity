@@ -1815,9 +1815,12 @@ MonoBehaviour:
   plcConnection: {fileID: 1687192812}
   processController: {fileID: 626105813}
   productMover: {fileID: 261814999}
+  cylinderController: {fileID: 104244732}
   product: {fileID: 261814994}
   productStartPoint: {fileID: 1651594510}
   inspectionStopPoint: {fileID: 1941757212}
+  okTargetPoint: {fileID: 1158382700}
+  ngTargetPoint: {fileID: 575541518}
   positionTolerance: 0.05
 --- !u!1 &1826836885
 GameObject:
