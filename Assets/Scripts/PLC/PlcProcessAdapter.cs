@@ -77,6 +77,9 @@ public sealed class PlcProcessAdapter : MonoBehaviour
     [SerializeField] private Transform okTargetPoint;
     [SerializeField] private Transform ngTargetPoint;
 
+    [Header("Discharged Product")]
+    [SerializeField] private DischargedProductSpawner dischargedProductSpawner;
+
     [SerializeField, Min(0f)] private float positionTolerance = 0.05f;
 
     private bool appliedMode;
@@ -91,8 +94,25 @@ public sealed class PlcProcessAdapter : MonoBehaviour
     private DischargeState dischargeState;
     private CyclePreparationState cyclePreparationState;
     private int submittedResultBits;
+    private bool dischargedProductSpawnedThisCycle;
 
     public bool PlcIntegrationMode => plcIntegrationMode;
+    public bool CanSubmitInspectionResult =>
+        plcIntegrationMode &&
+        plcConnection != null &&
+        plcConnection.Connected &&
+        plcConnection.D0Ready &&
+        inspectionHandshakeState == InspectionHandshakeState.WaitingForResultInput;
+
+    public bool TrySubmitInspectionResult(bool isOk)
+    {
+        if (!CanSubmitInspectionResult)
+        {
+            return false;
+        }
+
+        return SubmitInspectionResult(isOk);
+    }
 
     private void Start()
     {
@@ -108,6 +128,7 @@ public sealed class PlcProcessAdapter : MonoBehaviour
         dischargeState = DischargeState.WaitingForCommand;
         cyclePreparationState = CyclePreparationState.Inactive;
         submittedResultBits = 0;
+        dischargedProductSpawnedThisCycle = false;
 
         if (plcConnection != null)
         {
@@ -182,6 +203,7 @@ public sealed class PlcProcessAdapter : MonoBehaviour
         dischargeState = DischargeState.WaitingForCommand;
         cyclePreparationState = CyclePreparationState.Inactive;
         submittedResultBits = 0;
+        dischargedProductSpawnedThisCycle = false;
     }
 
     private void UpdateProductSensorLevel()
@@ -442,11 +464,11 @@ public sealed class PlcProcessAdapter : MonoBehaviour
 
                 if (keyboard.oKey.wasPressedThisFrame)
                 {
-                    SubmitInspectionResult(true);
+                    TrySubmitInspectionResult(true);
                 }
                 else if (keyboard.nKey.wasPressedThisFrame)
                 {
-                    SubmitInspectionResult(false);
+                    TrySubmitInspectionResult(false);
                 }
                 break;
 
@@ -460,7 +482,7 @@ public sealed class PlcProcessAdapter : MonoBehaviour
         }
     }
 
-    private void SubmitInspectionResult(bool isOk)
+    private bool SubmitInspectionResult(bool isOk)
     {
         submittedResultBits = InspectionCompleteBit |
                               (isOk ? InspectionOkBit : InspectionNgBit);
@@ -474,7 +496,10 @@ public sealed class PlcProcessAdapter : MonoBehaviour
             inspectionHandshakeState = InspectionHandshakeState.WaitingForResultInput;
             submittedResultBits = 0;
             Debug.Log("[PLC INSPECTION] Result D0 write failed: request rejected");
+            return false;
         }
+
+        return true;
     }
 
     private void BeginClearInspectionResult()
@@ -841,6 +866,7 @@ public sealed class PlcProcessAdapter : MonoBehaviour
                 dischargeState = DischargeState.Completed;
                 Debug.Log("[PLC DISCHARGE] Discharge complete OFF");
                 Debug.Log("[PLC CYCLE] OK cycle ACK completed");
+                SpawnDischargedProductOnce(DischargedProductSpawner.DischargeRoute.Ok);
                 BeginNextCyclePreparation();
                 break;
 
@@ -875,9 +901,29 @@ public sealed class PlcProcessAdapter : MonoBehaviour
                 dischargeState = DischargeState.Completed;
                 Debug.Log("[PLC DISCHARGE] NG cycle completed");
                 Debug.Log("[PLC CYCLE] NG cycle ACK completed");
+                SpawnDischargedProductOnce(DischargedProductSpawner.DischargeRoute.Ng);
                 BeginNextCyclePreparation();
                 break;
         }
+    }
+
+    private void SpawnDischargedProductOnce(DischargedProductSpawner.DischargeRoute route)
+    {
+        if (dischargedProductSpawnedThisCycle ||
+            !plcIntegrationMode ||
+            !repeatProductionInPlcMode)
+        {
+            return;
+        }
+
+        dischargedProductSpawnedThisCycle = true;
+        if (dischargedProductSpawner == null)
+        {
+            Debug.LogWarning("[DISCHARGED PRODUCT] Spawner reference is missing");
+            return;
+        }
+
+        dischargedProductSpawner.TrySpawn(product, route);
     }
 
     private void BeginNextCyclePreparation()
@@ -987,6 +1033,7 @@ public sealed class PlcProcessAdapter : MonoBehaviour
         dischargeState = DischargeState.WaitingForCommand;
         conveyorStateInitialized = false;
         previousConveyorCommand = false;
+        dischargedProductSpawnedThisCycle = false;
         productMover.ResetMovementState();
     }
 
