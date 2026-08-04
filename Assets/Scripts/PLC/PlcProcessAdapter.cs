@@ -95,10 +95,24 @@ public sealed class PlcProcessAdapter : MonoBehaviour
     private CyclePreparationState cyclePreparationState;
     private int submittedResultBits;
     private bool dischargedProductSpawnedThisCycle;
+    private bool safetyResetActive;
+    private bool allowSafetyProductSensor;
+    private int processGeneration;
 
     public bool PlcIntegrationMode => plcIntegrationMode;
+    public bool SafetyResetActive => safetyResetActive;
+    public int ProcessGeneration => processGeneration;
+    public bool IsCylinderRetracted =>
+        cylinderController != null && cylinderController.IsRetracted;
+    public bool IsProductAtStart => IsProductAtStartPose();
+    public bool HasPendingProcessWrites =>
+        productSensorWritePending || inspectionSensorWritePending ||
+        inspectionHandshakeState == InspectionHandshakeState.WritingResult ||
+        inspectionHandshakeState == InspectionHandshakeState.ClearingResult ||
+        IsDischargeWritePending();
     public bool CanSubmitInspectionResult =>
         plcIntegrationMode &&
+        !safetyResetActive &&
         plcConnection != null &&
         plcConnection.Connected &&
         plcConnection.D0Ready &&
@@ -146,6 +160,16 @@ public sealed class PlcProcessAdapter : MonoBehaviour
 
         if (!plcIntegrationMode)
         {
+            return;
+        }
+
+        if (safetyResetActive)
+        {
+            if (allowSafetyProductSensor && plcConnection != null &&
+                plcConnection.Connected && productMover != null && product != null)
+            {
+                UpdateProductSensorLevel();
+            }
             return;
         }
 
@@ -354,6 +378,21 @@ public sealed class PlcProcessAdapter : MonoBehaviour
 
     private void OnD0WriteCompleted(int result, int value)
     {
+        if (safetyResetActive)
+        {
+            if (allowSafetyProductSensor)
+            {
+                CompleteLevelInputWrite(
+                    ProductSensorBit,
+                    result,
+                    value,
+                    ref productSensorWritePending,
+                    productSensorPendingValue,
+                    "Product sensor");
+            }
+            return;
+        }
+
         CompleteLevelInputWrite(
             ProductSensorBit,
             result,
@@ -909,7 +948,7 @@ public sealed class PlcProcessAdapter : MonoBehaviour
 
     private void SpawnDischargedProductOnce(DischargedProductSpawner.DischargeRoute route)
     {
-        if (dischargedProductSpawnedThisCycle ||
+        if (safetyResetActive || dischargedProductSpawnedThisCycle ||
             !plcIntegrationMode ||
             !repeatProductionInPlcMode)
         {
@@ -928,7 +967,7 @@ public sealed class PlcProcessAdapter : MonoBehaviour
 
     private void BeginNextCyclePreparation()
     {
-        if (!repeatProductionInPlcMode || !plcIntegrationMode)
+        if (safetyResetActive || !repeatProductionInPlcMode || !plcIntegrationMode)
         {
             return;
         }
@@ -1035,6 +1074,116 @@ public sealed class PlcProcessAdapter : MonoBehaviour
         previousConveyorCommand = false;
         dischargedProductSpawnedThisCycle = false;
         productMover.ResetMovementState();
+    }
+
+    public void BeginSafetyReset()
+    {
+        processGeneration++;
+        safetyResetActive = true;
+        allowSafetyProductSensor = false;
+        productSensorWritePending = false;
+        inspectionSensorWritePending = false;
+        inspectionReached = false;
+        inspectionHandshakeState = InspectionHandshakeState.WaitingForRequest;
+        submittedResultBits = 0;
+        dischargeState = DischargeState.WaitingForCommand;
+        cyclePreparationState = CyclePreparationState.Inactive;
+        conveyorStateInitialized = false;
+        previousConveyorCommand = false;
+        dischargedProductSpawnedThisCycle = true;
+
+        if (productMover != null)
+        {
+            productMover.ResetMovementState();
+        }
+
+        if (processController != null)
+        {
+            processController.ResetForPlcSafety();
+        }
+    }
+
+    public void RequestSafetyCylinderRetract()
+    {
+        if (cylinderController != null && !cylinderController.IsRetracted)
+        {
+            cylinderController.BeginRetract();
+        }
+    }
+
+    public bool RestoreSafetyProductToStart()
+    {
+        if (productMover == null || product == null || productStartPoint == null ||
+            productMover.transform != product)
+        {
+            return false;
+        }
+
+        productMover.ResetMovementState();
+        RestoreProductToStartPose();
+        ResetInternalCycleState();
+        if (processController != null)
+        {
+            processController.ResetForPlcSafety();
+        }
+
+        return IsProductAtStartPose() && !productMover.IsMoving;
+    }
+
+    public void AllowSafetyProductSensorUpdates()
+    {
+        allowSafetyProductSensor = true;
+    }
+
+    public bool VerifySafetyResetState()
+    {
+        return safetyResetActive && IsCylinderRetracted && IsProductAtStartPose() &&
+               productMover != null && !productMover.IsMoving &&
+               inspectionHandshakeState == InspectionHandshakeState.WaitingForRequest &&
+               dischargeState == DischargeState.WaitingForCommand &&
+               cyclePreparationState == CyclePreparationState.Inactive &&
+               submittedResultBits == 0 && !inspectionSensorWritePending &&
+               !dischargedProductSpawnedThisCycle;
+    }
+
+    public void CompleteSafetyReset()
+    {
+        ResetInternalCycleState();
+        allowSafetyProductSensor = false;
+        safetyResetActive = false;
+    }
+
+    public void FaultSafetyReset()
+    {
+        safetyResetActive = true;
+        allowSafetyProductSensor = false;
+        if (productMover != null)
+        {
+            productMover.ResetMovementState();
+        }
+    }
+
+    private bool IsProductAtStartPose()
+    {
+        if (product == null || productStartPoint == null)
+        {
+            return false;
+        }
+
+        return Vector3.Distance(product.position, productStartPoint.position) <= positionTolerance &&
+               Quaternion.Angle(product.rotation, productStartPoint.rotation) <= 0.5f;
+    }
+
+    private bool IsDischargeWritePending()
+    {
+        return dischargeState == DischargeState.WritingOkDischargeComplete ||
+               dischargeState == DischargeState.ClearingOkDischargeComplete ||
+               dischargeState == DischargeState.WritingCylinderExtended ||
+               dischargeState == DischargeState.ClearingCylinderExtended ||
+               dischargeState == DischargeState.WritingNgDischargeComplete ||
+               dischargeState == DischargeState.ClearingNgDischargeComplete ||
+               dischargeState == DischargeState.WritingCylinderRetracted ||
+               dischargeState == DischargeState.ClearingCylinderRetracted;
     }
 
     private void FailCyclePreparation(string message)

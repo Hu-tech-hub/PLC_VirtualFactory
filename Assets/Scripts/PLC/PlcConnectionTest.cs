@@ -36,6 +36,7 @@ public sealed class PlcConnectionTest : MonoBehaviour
         public int Value;
         public int Mask;
         public int EnabledBits;
+        public bool IsD0MaskedWrite;
         public bool IsD101MaskedWrite;
     }
 
@@ -91,8 +92,10 @@ public sealed class PlcConnectionTest : MonoBehaviour
     public float LastDataUpdateRealtime => lastDataUpdateRealtime;
     public string LastBridgeDiagnostic => lastBridgeDiagnostic;
     public int PendingRequestCount => requestQueue.Count + (inFlightRequest != null ? 1 : 0);
+    public bool HasPendingD0Writes => HasPendingD0WriteRequest();
 
     public event Action<int, int> D0WriteCompleted;
+    public event Action<long, int, int> D0WriteRequestCompleted;
     public event Action<long, int, int> D101WriteCompleted;
 
     private void Awake()
@@ -219,6 +222,34 @@ public sealed class PlcConnectionTest : MonoBehaviour
 
         d0Queued = false;
         StartD0Write(newValue);
+        return true;
+    }
+
+    public bool TrySetD0MaskedBitsTracked(
+        int mask,
+        int enabledBits,
+        out long requestId)
+    {
+        requestId = 0;
+        mask &= 0xFFFF;
+        if (!connected || !d0Ready || mask == 0)
+        {
+            return false;
+        }
+
+        var request = new PlcRequest
+        {
+            Id = ++nextRequestId,
+            Kind = RequestKind.Write,
+            Device = "D0",
+            Mask = mask,
+            EnabledBits = enabledBits & mask,
+            IsD0MaskedWrite = true
+        };
+
+        requestId = request.Id;
+        // RESET writes must stay behind every previously queued process write.
+        EnqueueRequest(request, false);
         return true;
     }
 
@@ -406,6 +437,31 @@ public sealed class PlcConnectionTest : MonoBehaviour
         return false;
     }
 
+    private bool HasPendingD0WriteRequest()
+    {
+        if (d0WriteInProgress || d0Queued)
+        {
+            return true;
+        }
+
+        if (inFlightRequest != null && inFlightRequest.Kind == RequestKind.Write &&
+            inFlightRequest.Device.Equals("D0", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        foreach (PlcRequest request in requestQueue)
+        {
+            if (request.Kind == RequestKind.Write &&
+                request.Device.Equals("D0", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private void TryDispatchNextRequest()
     {
         if (!connected || inFlightRequest != null || requestQueue.Count == 0)
@@ -416,7 +472,14 @@ public sealed class PlcConnectionTest : MonoBehaviour
         inFlightRequest = requestQueue.First.Value;
         requestQueue.RemoveFirst();
 
-        if (inFlightRequest.IsD101MaskedWrite)
+        if (inFlightRequest.IsD0MaskedWrite)
+        {
+            inFlightRequest.Value = CalculateMaskedWord(
+                d0Word,
+                inFlightRequest.Mask,
+                inFlightRequest.EnabledBits);
+        }
+        else if (inFlightRequest.IsD101MaskedWrite)
         {
             inFlightRequest.Value = CalculateMaskedWord(
                 d101Word,
@@ -582,6 +645,10 @@ public sealed class PlcConnectionTest : MonoBehaviour
             if (isD0Write)
             {
                 D0WriteCompleted?.Invoke(result, completedRequest.Value);
+                D0WriteRequestCompleted?.Invoke(
+                    completedRequest.Id,
+                    result,
+                    completedRequest.Value);
                 d0WriteInProgress = false;
                 d0Queued = false;
             }
@@ -601,6 +668,10 @@ public sealed class PlcConnectionTest : MonoBehaviour
             d0Word = completedRequest.Value;
             d0WriteInProgress = false;
             D0WriteCompleted?.Invoke(result, d0Word);
+            D0WriteRequestCompleted?.Invoke(
+                completedRequest.Id,
+                result,
+                d0Word);
         }
         else if (isD101Write)
         {
@@ -687,6 +758,16 @@ public sealed class PlcConnectionTest : MonoBehaviour
     private void FailPendingWriteRequests()
     {
         if (inFlightRequest != null && inFlightRequest.Kind == RequestKind.Write &&
+            inFlightRequest.Device.Equals("D0", StringComparison.OrdinalIgnoreCase))
+        {
+            D0WriteCompleted?.Invoke(RequestFailureCode, inFlightRequest.Value);
+            D0WriteRequestCompleted?.Invoke(
+                inFlightRequest.Id,
+                RequestFailureCode,
+                inFlightRequest.Value);
+        }
+
+        if (inFlightRequest != null && inFlightRequest.Kind == RequestKind.Write &&
             inFlightRequest.Device.Equals("D101", StringComparison.OrdinalIgnoreCase))
         {
             D101WriteCompleted?.Invoke(inFlightRequest.Id, RequestFailureCode, inFlightRequest.Value);
@@ -694,7 +775,20 @@ public sealed class PlcConnectionTest : MonoBehaviour
 
         foreach (PlcRequest request in requestQueue)
         {
-            if (request.Kind == RequestKind.Write &&
+            if (request.Kind != RequestKind.Write)
+            {
+                continue;
+            }
+
+            if (request.Device.Equals("D0", StringComparison.OrdinalIgnoreCase))
+            {
+                D0WriteCompleted?.Invoke(RequestFailureCode, request.Value);
+                D0WriteRequestCompleted?.Invoke(
+                    request.Id,
+                    RequestFailureCode,
+                    request.Value);
+            }
+            else if (
                 request.Device.Equals("D101", StringComparison.OrdinalIgnoreCase))
             {
                 D101WriteCompleted?.Invoke(request.Id, RequestFailureCode, request.Value);

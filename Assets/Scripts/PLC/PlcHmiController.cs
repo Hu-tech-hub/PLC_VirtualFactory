@@ -11,10 +11,14 @@ public sealed class PlcHmiController : MonoBehaviour
 {
     private const int StartBit = 1 << 0;
     private const int StopBit = 1 << 1;
+    private const int ResetPulseBit = 1 << 2;
     private const int ManualAutoMask = (1 << 3) | (1 << 4);
     private const int AutoBit = 1 << 3;
     private const int ManualBit = 1 << 4;
     private const int EmergencyStopBit = 1 << 13;
+    private const int ResetRequestBit = 1 << 5;
+    private const int ResetAckBit = 1 << 8;
+    private const int ProcessD0Mask = 0x00FE;
 
     [Header("PLC")]
     [SerializeField] private PlcConnectionTest plcConnection;
@@ -29,8 +33,13 @@ public sealed class PlcHmiController : MonoBehaviour
     [SerializeField, Min(1f)] private float staleAfterSeconds = 5f;
     [SerializeField, Min(0.5f)] private float writeResponseTimeoutSeconds = 5f;
     [SerializeField, Min(0.5f)] private float emergencyFeedbackTimeoutSeconds = 5f;
+    [SerializeField, Range(0.1f, 0.2f)] private float resetPulseSeconds = 0.15f;
+    [SerializeField, Min(0.5f)] private float resetRequestTimeoutSeconds = 10f;
+    [SerializeField, Min(0.5f)] private float cylinderRetractTimeoutSeconds = 5f;
 
     private readonly Dictionary<long, WriteResult> completedWrites = new Dictionary<long, WriteResult>();
+    private readonly Dictionary<long, WriteResult> completedD0Writes = new Dictionary<long, WriteResult>();
+    private readonly HashSet<long> trackedResetD0Requests = new HashSet<long>();
     private readonly HashSet<long> abandonedWriteRequests = new HashSet<long>();
     private PlcHmiInteractable[] controls = Array.Empty<PlcHmiInteractable>();
     private PlcHmiIndicator[] indicators = Array.Empty<PlcHmiIndicator>();
@@ -59,6 +68,15 @@ public sealed class PlcHmiController : MonoBehaviour
     private int heldMomentaryBit;
     private bool heldMomentaryReleaseRequested;
     private bool heldMomentaryOffQueued;
+    private ResetState resetState = ResetState.Idle;
+    private long resetRequestId;
+    private float resetStateDeadline;
+    private float resetPulseReleaseAt;
+    private bool resetPulseMayBeOn;
+    private bool resetRequestOnObserved;
+    private bool resetFaultLogged;
+    private string resetFaultReason = string.Empty;
+    private PlcHmiInteractable resetControl;
 
     private struct WriteResult
     {
@@ -72,6 +90,27 @@ public sealed class PlcHmiController : MonoBehaviour
         Off,
         Manual,
         Auto
+    }
+
+    private enum ResetState
+    {
+        Idle,
+        SendingResetPulseOn,
+        HoldingResetPulse,
+        SendingResetPulseOff,
+        WaitingForPlcResetRequest,
+        QuiescingProcess,
+        WaitingForExistingD0Writes,
+        RetractingCylinder,
+        RestoringProduct,
+        ClearingProcessBits,
+        VerifyingSafeState,
+        SettingResetAck,
+        WaitingForPlcRequestOff,
+        ClearingResetAck,
+        VerifyingResetComplete,
+        RecoveringResetPulseOff,
+        Faulted
     }
 
     private void Awake()
@@ -99,6 +138,8 @@ public sealed class PlcHmiController : MonoBehaviour
     {
         if (plcConnection != null)
         {
+            plcConnection.D0WriteRequestCompleted -= OnD0WriteRequestCompleted;
+            plcConnection.D0WriteRequestCompleted += OnD0WriteRequestCompleted;
             plcConnection.D101WriteCompleted -= OnD101WriteCompleted;
             plcConnection.D101WriteCompleted += OnD101WriteCompleted;
         }
@@ -108,12 +149,16 @@ public sealed class PlcHmiController : MonoBehaviour
     {
         if (plcConnection != null)
         {
+            ForceResetPulseOffBestEffort();
+            plcConnection.D0WriteRequestCompleted -= OnD0WriteRequestCompleted;
             plcConnection.D101WriteCompleted -= OnD101WriteCompleted;
         }
 
         ForceReleaseHeldMomentary();
         StopAllCoroutines();
         completedWrites.Clear();
+        completedD0Writes.Clear();
+        trackedResetD0Requests.Clear();
         abandonedWriteRequests.Clear();
         startPulsePending = false;
         stopPulsePending = false;
@@ -135,10 +180,16 @@ public sealed class PlcHmiController : MonoBehaviour
                 control.SetPending(false);
             }
         }
+
+        if (resetState != ResetState.Idle && processAdapter != null)
+        {
+            processAdapter.FaultSafetyReset();
+        }
     }
 
     private void Update()
     {
+        UpdateResetStateMachine();
         HandleWorldInteraction();
         if (Time.unscaledTime >= nextRefreshTime)
         {
@@ -152,12 +203,20 @@ public sealed class PlcHmiController : MonoBehaviour
         if (!hasFocus)
         {
             RequestMomentaryRelease();
+            RequestEarlyResetPulseRelease();
         }
     }
 
     public bool TryActivateControl(PlcHmiInteractable control)
     {
         if (control == null || plcConnection == null)
+        {
+            return false;
+        }
+
+        if (IsResetBusy &&
+            control.Kind != PlcHmiInteractable.ControlKind.EmergencyStop &&
+            control.Kind != PlcHmiInteractable.ControlKind.Reset)
         {
             return false;
         }
@@ -251,8 +310,8 @@ public sealed class PlcHmiController : MonoBehaviour
             case PlcHmiInteractable.ControlKind.EmergencyRelease:
                 return false;
 
-            case PlcHmiInteractable.ControlKind.ResetDisabled:
-                return false;
+            case PlcHmiInteractable.ControlKind.Reset:
+                return TryStartResetPulse(control);
 
             default:
                 return false;
@@ -400,6 +459,583 @@ public sealed class PlcHmiController : MonoBehaviour
             heldMomentaryReleaseRequested = false;
             heldMomentaryOffQueued = false;
         }
+    }
+
+    public string ResetStateName => resetState.ToString();
+    public bool ResetFaulted => resetState == ResetState.Faulted;
+    private bool IsResetBusy => resetState != ResetState.Idle;
+
+    private bool TryStartResetPulse(PlcHmiInteractable control)
+    {
+        if (!CanReset() || !TryQueueD101(
+                ResetPulseBit,
+                ResetPulseBit,
+                false,
+                out resetRequestId))
+        {
+            return false;
+        }
+
+        resetControl = control;
+        resetFaultLogged = false;
+        resetFaultReason = string.Empty;
+        resetRequestOnObserved = false;
+        resetPulseMayBeOn = false;
+        resetState = ResetState.SendingResetPulseOn;
+        resetStateDeadline = Time.realtimeSinceStartup + writeResponseTimeoutSeconds;
+        control.PlayMomentaryPress();
+        control.SetPending(true);
+        return true;
+    }
+
+    private bool CanReset()
+    {
+        if (resetState != ResetState.Idle || plcConnection == null ||
+            !plcConnection.Connected || !plcConnection.D0Ready ||
+            !plcConnection.D101Ready || !IsCommunicationFresh() ||
+            !IsFreshDeviceOn("M400") ||
+            !TryGetConfirmedEmergencyFeedback(out bool emergencyActive) ||
+            emergencyActive || (plcConnection.D0Word & ResetAckBit) != 0 ||
+            (plcConnection.D101Word & ResetPulseBit) != 0)
+        {
+            return false;
+        }
+
+        return TryFreshDevice("D100", out int d100) &&
+               (d100 & ResetRequestBit) == 0;
+    }
+
+    private void UpdateResetStateMachine()
+    {
+        if (plcConnection == null)
+        {
+            return;
+        }
+
+        if (resetState == ResetState.Idle)
+        {
+            if (plcConnection.Connected && plcConnection.D101Ready &&
+                (plcConnection.D101Word & ResetPulseBit) != 0)
+            {
+                BeginResetPulseOffRecovery();
+                return;
+            }
+
+            if (TryGetResetRequest(out bool resetRequested))
+            {
+                bool ackOn = plcConnection.D0Ready &&
+                             (plcConnection.D0Word & ResetAckBit) != 0;
+                if (resetRequested && ackOn)
+                {
+                    resetRequestOnObserved = true;
+                    if (processAdapter != null && !processAdapter.SafetyResetActive)
+                    {
+                        processAdapter.BeginSafetyReset();
+                    }
+                    processAdapter?.AllowSafetyProductSensorUpdates();
+                    resetState = ResetState.WaitingForPlcRequestOff;
+                }
+                else if (resetRequested)
+                {
+                    BeginAcceptedPlcResetRequest();
+                }
+                else if (ackOn)
+                {
+                    if (processAdapter != null && !processAdapter.SafetyResetActive)
+                    {
+                        processAdapter.BeginSafetyReset();
+                    }
+                    BeginResetAckClear();
+                }
+            }
+            return;
+        }
+
+        if (resetState == ResetState.Faulted)
+        {
+            UpdateFaultRecovery();
+            return;
+        }
+
+        if (!plcConnection.Connected || !plcConnection.D0Ready ||
+            !plcConnection.D101Ready)
+        {
+            EnterResetFault("PLC disconnected or D0/D101 is not ready");
+            return;
+        }
+
+        if (resetRequestOnObserved &&
+            resetState != ResetState.ClearingResetAck &&
+            resetState != ResetState.VerifyingResetComplete &&
+            !TryGetResetRequest(out _))
+        {
+            EnterResetFault("D100.5 data became stale during reset recovery");
+            return;
+        }
+
+        if (resetRequestOnObserved &&
+            (!TryGetConfirmedEmergencyFeedback(out bool resetEmergencyActive) ||
+             resetEmergencyActive))
+        {
+            EnterResetFault("E-STOP became active or stale during reset recovery");
+            return;
+        }
+
+        switch (resetState)
+        {
+            case ResetState.SendingResetPulseOn:
+                if (TryTakeD101Write(resetRequestId, out WriteResult pulseOn))
+                {
+                    if (pulseOn.Result != 0)
+                    {
+                        EnterResetFault("D101.2 ON write failed");
+                        return;
+                    }
+
+                    resetPulseMayBeOn = true;
+                    resetPulseReleaseAt = Time.realtimeSinceStartup + resetPulseSeconds;
+                    resetState = ResetState.HoldingResetPulse;
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("D101.2 ON response timeout");
+                }
+                break;
+
+            case ResetState.HoldingResetPulse:
+                if (Time.realtimeSinceStartup >= resetPulseReleaseAt)
+                {
+                    BeginResetPulseOff(false);
+                }
+                break;
+
+            case ResetState.SendingResetPulseOff:
+                if (TryTakeD101Write(resetRequestId, out WriteResult pulseOff))
+                {
+                    if (pulseOff.Result != 0)
+                    {
+                        EnterResetFault("D101.2 OFF write failed");
+                        return;
+                    }
+
+                    resetPulseMayBeOn = false;
+                    resetState = ResetState.WaitingForPlcResetRequest;
+                    resetStateDeadline = Time.realtimeSinceStartup + resetRequestTimeoutSeconds;
+                    if (resetControl != null)
+                    {
+                        resetControl.SetPending(true);
+                    }
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("D101.2 OFF response timeout");
+                }
+                break;
+
+            case ResetState.WaitingForPlcResetRequest:
+                if (!TryGetResetRequest(out bool waitingRequest))
+                {
+                    if (HasResetStateTimedOut())
+                    {
+                        EnterResetFault("D100.5 data became stale");
+                    }
+                }
+                else if (waitingRequest)
+                {
+                    BeginAcceptedPlcResetRequest();
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("PLC did not assert D100.5");
+                }
+                break;
+
+            case ResetState.QuiescingProcess:
+                if (processAdapter == null)
+                {
+                    EnterResetFault("PlcProcessAdapter reference is missing");
+                    return;
+                }
+
+                processAdapter.BeginSafetyReset();
+                resetState = ResetState.WaitingForExistingD0Writes;
+                resetStateDeadline = Time.realtimeSinceStartup + writeResponseTimeoutSeconds;
+                break;
+
+            case ResetState.WaitingForExistingD0Writes:
+                if (!plcConnection.HasPendingD0Writes)
+                {
+                    processAdapter.RequestSafetyCylinderRetract();
+                    resetState = ResetState.RetractingCylinder;
+                    resetStateDeadline = Time.realtimeSinceStartup + cylinderRetractTimeoutSeconds;
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("Existing D0 write barrier timeout");
+                }
+                break;
+
+            case ResetState.RetractingCylinder:
+                if (!TryGetConfirmedEmergencyFeedback(out bool emergencyActive) || emergencyActive)
+                {
+                    EnterResetFault("E-STOP became active or stale during cylinder retraction");
+                }
+                else if (processAdapter.IsCylinderRetracted)
+                {
+                    resetState = ResetState.RestoringProduct;
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("Cylinder retraction timeout");
+                }
+                break;
+
+            case ResetState.RestoringProduct:
+                if (!processAdapter.RestoreSafetyProductToStart())
+                {
+                    EnterResetFault("Process product could not be restored to the start pose");
+                    return;
+                }
+
+                if (!TryQueueTrackedD0(ProcessD0Mask, 0, ResetState.ClearingProcessBits))
+                {
+                    EnterResetFault("D0.1-D0.7 clear request was rejected");
+                }
+                break;
+
+            case ResetState.ClearingProcessBits:
+                if (TryTakeD0Write(resetRequestId, out WriteResult clearResult))
+                {
+                    if (clearResult.Result != 0 ||
+                        (clearResult.Value & ProcessD0Mask) != 0)
+                    {
+                        EnterResetFault("D0.1-D0.7 clear write failed");
+                        return;
+                    }
+
+                    resetState = ResetState.VerifyingSafeState;
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("D0.1-D0.7 clear response timeout");
+                }
+                break;
+
+            case ResetState.VerifyingSafeState:
+                if (!VerifyPreAckSafeState())
+                {
+                    EnterResetFault("Unity safe state verification failed");
+                    return;
+                }
+
+                if (!TryQueueTrackedD0(ResetAckBit, ResetAckBit, ResetState.SettingResetAck))
+                {
+                    EnterResetFault("D0.8 ON request was rejected");
+                }
+                break;
+
+            case ResetState.SettingResetAck:
+                if (TryTakeD0Write(resetRequestId, out WriteResult ackOn))
+                {
+                    if (ackOn.Result != 0 || (ackOn.Value & ResetAckBit) == 0)
+                    {
+                        EnterResetFault("D0.8 ON write failed");
+                        return;
+                    }
+
+                    processAdapter.AllowSafetyProductSensorUpdates();
+                    resetState = ResetState.WaitingForPlcRequestOff;
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("D0.8 ON response timeout");
+                }
+                break;
+
+            case ResetState.WaitingForPlcRequestOff:
+                if (!TryGetResetRequest(out bool requestStillOn))
+                {
+                    EnterResetFault("D100.5 data became stale while ACK was ON");
+                }
+                else if (!requestStillOn)
+                {
+                    if (!plcConnection.HasPendingD0Writes &&
+                        (processAdapter == null || !processAdapter.HasPendingProcessWrites))
+                    {
+                        BeginResetAckClear();
+                    }
+                }
+                break;
+
+            case ResetState.ClearingResetAck:
+                if (TryTakeD0Write(resetRequestId, out WriteResult ackOff))
+                {
+                    if (ackOff.Result != 0 || (ackOff.Value & ResetAckBit) != 0)
+                    {
+                        EnterResetFault("D0.8 OFF write failed");
+                        return;
+                    }
+
+                    resetState = ResetState.VerifyingResetComplete;
+                    resetStateDeadline = Time.realtimeSinceStartup + writeResponseTimeoutSeconds;
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("D0.8 OFF response timeout");
+                }
+                break;
+
+            case ResetState.VerifyingResetComplete:
+                if (VerifyResetComplete())
+                {
+                    processAdapter.CompleteSafetyReset();
+                    resetState = ResetState.Idle;
+                    resetRequestOnObserved = false;
+                    resetFaultLogged = false;
+                    resetFaultReason = string.Empty;
+                    if (resetControl != null)
+                    {
+                        resetControl.SetPending(false);
+                        resetControl.SetFaulted(false);
+                    }
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("Final PLC/Unity reset state verification timeout");
+                }
+                break;
+
+            case ResetState.RecoveringResetPulseOff:
+                if (TryTakeD101Write(resetRequestId, out WriteResult recoveredOff))
+                {
+                    if (recoveredOff.Result != 0)
+                    {
+                        EnterResetFault("Recovered D101.2 OFF write failed");
+                        return;
+                    }
+
+                    resetPulseMayBeOn = false;
+                    resetState = ResetState.Faulted;
+                    UpdateFaultRecovery();
+                }
+                else if (HasResetStateTimedOut())
+                {
+                    EnterResetFault("Recovered D101.2 OFF response timeout");
+                }
+                break;
+        }
+    }
+
+    private void BeginAcceptedPlcResetRequest()
+    {
+        if (resetRequestOnObserved)
+        {
+            return;
+        }
+
+        resetRequestOnObserved = true;
+        resetState = ResetState.QuiescingProcess;
+        resetStateDeadline = Time.realtimeSinceStartup + writeResponseTimeoutSeconds;
+        if (resetControl != null)
+        {
+            resetControl.SetPending(true);
+        }
+    }
+
+    private void BeginResetPulseOff(bool recovery)
+    {
+        if (!TryQueueD101(ResetPulseBit, 0, true, out resetRequestId))
+        {
+            EnterResetFault("D101.2 OFF request was rejected");
+            return;
+        }
+
+        resetState = recovery
+            ? ResetState.RecoveringResetPulseOff
+            : ResetState.SendingResetPulseOff;
+        resetStateDeadline = Time.realtimeSinceStartup + writeResponseTimeoutSeconds;
+    }
+
+    private void BeginResetPulseOffRecovery()
+    {
+        resetPulseMayBeOn = true;
+        resetFaultReason = string.IsNullOrEmpty(resetFaultReason)
+            ? "Recovered a latched D101.2 reset pulse"
+            : resetFaultReason;
+        BeginResetPulseOff(true);
+    }
+
+    private void BeginResetAckClear()
+    {
+        if (!TryQueueTrackedD0(ResetAckBit, 0, ResetState.ClearingResetAck))
+        {
+            EnterResetFault("D0.8 OFF request was rejected");
+        }
+    }
+
+    private bool TryQueueTrackedD0(int mask, int enabledBits, ResetState nextState)
+    {
+        if (plcConnection == null || plcConnection.HasPendingD0Writes ||
+            !plcConnection.TrySetD0MaskedBitsTracked(mask, enabledBits, out resetRequestId))
+        {
+            return false;
+        }
+
+        resetState = nextState;
+        trackedResetD0Requests.Add(resetRequestId);
+        resetStateDeadline = Time.realtimeSinceStartup + writeResponseTimeoutSeconds;
+        return true;
+    }
+
+    private bool VerifyPreAckSafeState()
+    {
+        return plcConnection.Connected && plcConnection.D0Ready &&
+               !plcConnection.HasPendingD0Writes &&
+               (plcConnection.D0Word & ProcessD0Mask) == 0 &&
+               processAdapter != null && processAdapter.VerifySafetyResetState() &&
+               !processAdapter.HasPendingProcessWrites;
+    }
+
+    private bool VerifyResetComplete()
+    {
+        if (!TryGetResetRequest(out bool requestOn) || requestOn ||
+            !TryFreshDevice("M30", out int run) || run != 0 ||
+            !TryFreshDevice("D500", out int step) || step != 0)
+        {
+            return false;
+        }
+
+        return plcConnection.Connected && plcConnection.D0Ready &&
+               plcConnection.D101Ready && !plcConnection.HasPendingD0Writes &&
+               (plcConnection.D0Word & (ProcessD0Mask | ResetAckBit)) == 0 &&
+               (plcConnection.D101Word & ResetPulseBit) == 0 &&
+               processAdapter != null && processAdapter.VerifySafetyResetState() &&
+               !processAdapter.HasPendingProcessWrites;
+    }
+
+    private void EnterResetFault(string reason)
+    {
+        resetState = ResetState.Faulted;
+        resetFaultReason = reason;
+        if (processAdapter != null)
+        {
+            processAdapter.FaultSafetyReset();
+        }
+
+        if (resetControl != null)
+        {
+            resetControl.SetPending(false);
+            resetControl.SetFaulted(true);
+        }
+
+        if (!resetFaultLogged)
+        {
+            resetFaultLogged = true;
+            Debug.LogError($"[PLC RESET] {reason}");
+        }
+    }
+
+    private void UpdateFaultRecovery()
+    {
+        if (!plcConnection.Connected || !plcConnection.D0Ready ||
+            !plcConnection.D101Ready || !IsCommunicationFresh())
+        {
+            return;
+        }
+
+        if ((plcConnection.D101Word & ResetPulseBit) != 0)
+        {
+            BeginResetPulseOffRecovery();
+            return;
+        }
+
+        if (!TryGetResetRequest(out bool requestOn))
+        {
+            return;
+        }
+
+        bool ackOn = (plcConnection.D0Word & ResetAckBit) != 0;
+        if (requestOn && ackOn)
+        {
+            resetRequestOnObserved = true;
+            resetState = ResetState.WaitingForPlcRequestOff;
+        }
+        else if (requestOn)
+        {
+            resetRequestOnObserved = false;
+            BeginAcceptedPlcResetRequest();
+        }
+        else if (ackOn)
+        {
+            BeginResetAckClear();
+        }
+        else if (processAdapter != null && processAdapter.VerifySafetyResetState() &&
+                 TryFreshDevice("M30", out int run) && run == 0 &&
+                 TryFreshDevice("D500", out int step) && step == 0)
+        {
+            processAdapter.CompleteSafetyReset();
+            resetState = ResetState.Idle;
+            resetFaultLogged = false;
+            resetFaultReason = string.Empty;
+            if (resetControl != null)
+            {
+                resetControl.SetFaulted(false);
+            }
+        }
+    }
+
+    private bool TryGetResetRequest(out bool active)
+    {
+        active = false;
+        if (!TryFreshDevice("D100", out int d100))
+        {
+            return false;
+        }
+
+        active = (d100 & ResetRequestBit) != 0;
+        return true;
+    }
+
+    private bool HasResetStateTimedOut()
+    {
+        return Time.realtimeSinceStartup >= resetStateDeadline;
+    }
+
+    private bool TryTakeD101Write(long requestId, out WriteResult result)
+    {
+        return TakeWriteResult(requestId, out result);
+    }
+
+    private bool TryTakeD0Write(long requestId, out WriteResult result)
+    {
+        if (completedD0Writes.TryGetValue(requestId, out result))
+        {
+            completedD0Writes.Remove(requestId);
+            trackedResetD0Requests.Remove(requestId);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void RequestEarlyResetPulseRelease()
+    {
+        if (resetState == ResetState.HoldingResetPulse)
+        {
+            resetPulseReleaseAt = Time.realtimeSinceStartup;
+        }
+    }
+
+    private void ForceResetPulseOffBestEffort()
+    {
+        if (plcConnection == null || !plcConnection.Connected ||
+            !plcConnection.D101Ready ||
+            (!resetPulseMayBeOn && (plcConnection.D101Word & ResetPulseBit) == 0))
+        {
+            return;
+        }
+
+        plcConnection.TrySetD101MaskedBits(ResetPulseBit, 0, true, out _);
     }
 
     private IEnumerator MaintainedWrite(
@@ -567,6 +1203,14 @@ public sealed class PlcHmiController : MonoBehaviour
         completedWrites[requestId] = new WriteResult { Result = result, Value = value };
     }
 
+    private void OnD0WriteRequestCompleted(long requestId, int result, int value)
+    {
+        if (trackedResetD0Requests.Contains(requestId))
+        {
+            completedD0Writes[requestId] = new WriteResult { Result = result, Value = value };
+        }
+    }
+
     private void SetPulsePending(bool isStart, bool value)
     {
         if (isStart)
@@ -662,6 +1306,12 @@ public sealed class PlcHmiController : MonoBehaviour
             {
                 control.SetPending(emergencyWritePending);
             }
+            else if (control.Kind == PlcHmiInteractable.ControlKind.Reset)
+            {
+                resetControl = control;
+                control.SetPending(IsResetBusy && resetState != ResetState.Faulted);
+                control.SetFaulted(resetState == ResetState.Faulted);
+            }
         }
 
         RefreshInformationDisplay();
@@ -669,6 +1319,13 @@ public sealed class PlcHmiController : MonoBehaviour
 
     private bool IsControlAvailable(PlcHmiInteractable.ControlKind kind)
     {
+        if (IsResetBusy &&
+            kind != PlcHmiInteractable.ControlKind.EmergencyStop &&
+            kind != PlcHmiInteractable.ControlKind.Reset)
+        {
+            return false;
+        }
+
         bool ready = plcConnection != null && plcConnection.Connected && plcConnection.D101Ready;
         switch (kind)
         {
@@ -685,13 +1342,15 @@ public sealed class PlcHmiController : MonoBehaviour
                 return ready && IsCommunicationFresh() && IsFreshDeviceOn("M400") && !emergencyWritePending;
             case PlcHmiInteractable.ControlKind.EmergencyRelease:
                 return false;
+            case PlcHmiInteractable.ControlKind.Reset:
+                return CanReset();
             default: return false;
         }
     }
 
     private bool CanStart()
     {
-        if (plcConnection == null || !plcConnection.Connected || !plcConnection.D101Ready ||
+        if (IsResetBusy || plcConnection == null || !plcConnection.Connected || !plcConnection.D101Ready ||
             !IsCommunicationFresh() || !IsFreshDeviceOn("M400") || GetConfirmedMode() != ConfirmedMode.Auto ||
             !TryFreshDevice("M200", out int alarm) || alarm != 0)
         {
@@ -805,6 +1464,44 @@ public sealed class PlcHmiController : MonoBehaviour
             SetText(monitorAlarmCode, alarmCode.ToString("D3"), new Color(1f, 0.16f, 0.08f));
             SetText(monitorAlarmStatus, GetAlarmStatus(alarmCode), new Color(1f, 0.3f, 0.18f));
             SetAlarmPanelColor(new Color(0.28f, 0.025f, 0.02f, 0.97f));
+        }
+
+        if (resetState == ResetState.Faulted)
+        {
+            SetText(monitorStepStatus, "RESET FAULT", new Color(1f, 0.15f, 0.08f));
+            SetText(monitorAlarmStatus, "RESET: " + resetFaultReason, new Color(1f, 0.2f, 0.1f));
+            SetAlarmPanelColor(new Color(0.35f, 0.015f, 0.01f, 0.98f));
+        }
+        else if (IsResetBusy)
+        {
+            SetText(monitorStepStatus, "RESET " + GetResetStatusLabel(), new Color(1f, 0.72f, 0.08f));
+        }
+    }
+
+    private string GetResetStatusLabel()
+    {
+        switch (resetState)
+        {
+            case ResetState.SendingResetPulseOn:
+            case ResetState.HoldingResetPulse:
+            case ResetState.SendingResetPulseOff:
+                return "PB";
+            case ResetState.WaitingForPlcResetRequest:
+                return "PLC WAIT";
+            case ResetState.RetractingCylinder:
+                return "CYLINDER";
+            case ResetState.RestoringProduct:
+                return "PRODUCT";
+            case ResetState.ClearingProcessBits:
+                return "CLEAR";
+            case ResetState.SettingResetAck:
+                return "ACK ON";
+            case ResetState.WaitingForPlcRequestOff:
+                return "WAIT OFF";
+            case ResetState.ClearingResetAck:
+                return "ACK OFF";
+            default:
+                return "SAFE";
         }
     }
 

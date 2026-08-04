@@ -14,7 +14,7 @@ public sealed class PlcHmiInteractable : MonoBehaviour
         InspectionNg,
         EmergencyStop,
         EmergencyRelease,
-        ResetDisabled
+        Reset
     }
 
     public enum SelectorState
@@ -37,6 +37,7 @@ public sealed class PlcHmiInteractable : MonoBehaviour
     private Coroutine pressAnimation;
     private bool initialized;
     private bool pending;
+    private bool faulted;
     private Renderer[] visualRenderers;
     private Color[] enabledColors;
 
@@ -134,6 +135,18 @@ public sealed class PlcHmiInteractable : MonoBehaviour
         ApplyVisualState();
     }
 
+    public void SetFaulted(bool value)
+    {
+        InitializePose();
+        if (faulted == value)
+        {
+            return;
+        }
+
+        faulted = value;
+        ApplyVisualState();
+    }
+
     public void SetAvailable(bool available)
     {
         InitializePose();
@@ -152,8 +165,10 @@ public sealed class PlcHmiInteractable : MonoBehaviour
         {
             MaterialPropertyBlock block = new MaterialPropertyBlock();
             visualRenderers[index].GetPropertyBlock(block);
-            Color color = pending
-                ? new Color(1f, 0.55f, 0.05f, 1f)
+            Color color = faulted
+                ? new Color(1f, 0.08f, 0.04f, 1f)
+                : pending
+                    ? new Color(1f, 0.55f, 0.05f, 1f)
                 : Available
                     ? enabledColors[index]
                     : enabledColors[index] * 0.28f;
