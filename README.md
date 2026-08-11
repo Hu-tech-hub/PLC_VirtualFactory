@@ -4,6 +4,10 @@ GX Works3와 GX Simulator3로 구현한 가상 검사공정을 GT Designer3의 G
 
 PLC가 공정 순서와 인터록을 결정하고, Unity는 제품·컨베이어·검사 위치·배출 실린더를 가상 설비로 표현합니다. Unity와 Mitsubishi MX Component 사이의 COM 호환 문제는 별도의 64비트 C# 브리지인 `PlcMxBridge.exe`로 해결했습니다.
 
+![Unity 가상 검사공정 전체 구성](docs/images/unity/virtual-factory-overview.png)
+
+*Unity 가상 검사공정 전체 구성*
+
 ## 주요 구현 내용
 
 - GX Works3 기반 자동·수동 운전 및 단계식 시퀀스
@@ -14,6 +18,52 @@ PLC가 공정 순서와 인터록을 결정하고, Unity는 제품·컨베이어
 - GT Designer3 기반 운전·알람 모니터링
 - MX Component와 64비트 C# Bridge를 이용한 Unity–PLC 양방향 통신
 - 한 사이클 완료 후 다음 제품을 준비하는 자동 반복 생산
+
+## Unity 가상 설비 및 공정 시연
+
+### 제품 이송 및 OK·NG 분기 흐름
+
+![제품 이송 및 OK·NG 분기 흐름](docs/images/unity/process-flow.png)
+
+제품은 공급 위치에서 검사 위치로 이송됩니다. 검사 결과가 OK이면 컨베이어를 따라 직진 배출되고, NG이면 실린더가 제품을 별도 배출 위치로 밀어냅니다.
+
+### Unity 3D 운전 조작반
+
+![Unity 3D 운전 조작반](docs/images/unity/operator-panel.png)
+
+Unity 조작반에서는 Auto·Manual 모드, Start·Stop·Reset·비상정지, 운전·알람 상태와 생산수량을 확인할 수 있습니다. 이 조작반은 GT Designer3로 제작한 GOT 화면과 별도로 Unity 설비 안에 구현한 3D 운전 패널입니다.
+
+### 자동 공정 단계별 시연
+
+#### 1. 자동운전 시작
+
+![AUTO 모드 선택 및 START](docs/demos/01-auto-start.gif)
+
+Auto 모드를 선택하고 Start를 입력하면 PLC 운전 상태가 활성화되고 첫 제품 공급을 시작합니다.
+
+#### 2. 검사 위치 이송
+
+![제품 공급 및 검사 위치 이송](docs/demos/02-transfer-to-inspection.gif)
+
+제품이 컨베이어를 따라 이동한 뒤 검사 위치 센서에서 정지합니다.
+
+#### 3. 검사 결과 전달
+
+![검사 요청 및 OK·NG 결과 전달](docs/demos/03-inspection-result.gif)
+
+PLC가 검사 요청을 출력하면 Unity가 검사 완료와 OK 또는 NG 결과를 PLC에 전달합니다.
+
+#### 4. OK·NG 분기 배출
+
+![OK·NG 판정에 따른 제품 배출](docs/demos/04-ok-ng-discharge.gif)
+
+OK 제품은 직진 배출되고, NG 제품은 실린더 동작을 통해 별도 위치로 배출됩니다.
+
+#### 5. 자동 반복 생산
+
+![다음 제품 공급 및 자동 사이클 반복](docs/demos/05-automatic-cycle-repeat.gif)
+
+배출 완료와 수량 집계 후 별도의 Start 재입력 없이 다음 제품을 공급하며 자동 사이클을 반복합니다.
 
 ## 시스템 구성
 
@@ -220,9 +270,13 @@ PLC_VirtualFactory/
 ├─ PLC/
 │  ├─ PLC_VirtualFactory.gx3   # GX Works3 원본 프로젝트
 │  └─ DeviceMap_csv/           # POU별 프로그램 내보내기
-└─ GOT/
-   ├─ PLC_VirtualFactory.GTX   # GT Designer3 원본 프로젝트
-   └─ images/                  # GOT 화면 캡처
+├─ GOT/
+│  └─ PLC_VirtualFactory.GTX   # GT Designer3 원본 프로젝트
+└─ docs/
+   ├─ demos/                   # 단계별 Unity 실행 GIF
+   └─ images/
+      ├─ unity/                # 전체 설비·공정 흐름·3D 조작반 이미지
+      └─ got/                  # GOT 운전·알람·Simulator 화면
 ```
 
 ## 문제 해결 핵심
