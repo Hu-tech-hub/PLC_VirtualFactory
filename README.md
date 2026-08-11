@@ -243,7 +243,7 @@ cd PLC_VirtualFactory
 
 ### 4. 64비트 Bridge 빌드
 
-Unity를 실행하기 전에 저장소 루트에서 PowerShell을 열고 다음 명령을 실행합니다. 이 과정은 \`Tools/PlcMxBridge.cs\`를 64비트 실행 파일로 컴파일하여 Unity가 실행할 위치에 배치합니다.
+Unity에서 Play를 시작하기 전에 저장소 루트에서 PowerShell을 열고 다음 명령을 실행합니다. 이 과정은 \`Tools/PlcMxBridge.cs\`를 64비트 실행 파일로 컴파일하여 Unity가 실행할 위치에 배치합니다.
 
 \`\`\`powershell
 $projectRoot = (Get-Location).Path
