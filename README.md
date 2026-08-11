@@ -145,11 +145,11 @@ GX Works3 원본 프로젝트는 [PLC/PLC_VirtualFactory.gx3](PLC/PLC_VirtualFac
 
 ## GOT 화면
 
-![GOT 메인 운전 화면](GOT/images/main.png)
+![GOT 메인 운전 화면](docs/images/got/got-main-operation.png)
 
-![GOT 알람 화면](GOT/images/alarm.png)
+![GOT 알람 화면](docs/images/got/got-alarm-monitor.png)
 
-![GOT Simulator 실행 화면](GOT/images/simulation.png)
+![GOT Simulator 실행 화면](docs/images/got/got-simulator-operation.png)
 
 GT Designer3 원본 프로젝트는 [GOT/PLC_VirtualFactory.GTX](GOT/PLC_VirtualFactory.GTX)에서 확인할 수 있습니다.
 
