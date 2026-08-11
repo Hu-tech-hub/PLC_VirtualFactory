@@ -203,55 +203,115 @@ GX Works3 원본 프로젝트는 [PLC/PLC_VirtualFactory.gx3](PLC/PLC_VirtualFac
 
 GT Designer3 원본 프로젝트는 [GOT/PLC_VirtualFactory.GTX](GOT/PLC_VirtualFactory.GTX)에서 확인할 수 있습니다.
 
-## 실행 환경
+## 처음 실행하기
 
-- Windows 11 64-bit
-- Unity `6000.5.6f1`
-- GX Works3 / GX Simulator3
-- MELSEC iQ-R `R08CPU`
-- GT Designer3 / GOT Simulator
-- MX Component 5
-- .NET Framework 4.x
-- MX Component Logical Station Number: `1`
+### 1. 필수 프로그램 설치
 
-> MX Component COM 서버가 Windows에 설치·등록되어 있어야 합니다. 저장소의 Interop DLL만으로 MX Component 자체가 설치되는 것은 아닙니다.
+이 프로젝트는 Windows 11 64-bit에서 다음 버전으로 제작하고 실행했습니다.
 
-## 실행 순서
+| 프로그램 | 사용 버전 | 용도 |
+|---|---|---|
+| GX Works3 / GX Simulator3 | GX Works3 \`1.117X Demo Version\` | PLC 프로젝트 편집 및 R08CPU 시뮬레이션 |
+| GT Designer3 / GOT Simulator | GT Designer3 \`1.256S\` | GOT HMI 편집 및 선택적 시뮬레이션 |
+| MX Component | \`5.TRIAL (SW5DND-ACT-E)\` | GX Simulator3와 64비트 Bridge 사이의 통신 |
+| Unity Hub / Unity Editor | Unity \`6000.5.6f1\` | Unity 가상 설비 실행 |
+| .NET Framework | 4.x | \`PlcMxBridge.exe\` x64 컴파일 및 실행 |
+| Git | 최신 버전 | 저장소 클론 |
+
+> 위 표는 이 프로젝트에서 검증한 버전입니다. MX Component는 반드시 Windows에 설치되어 COM 서버가 등록되어 있어야 하며, 저장소의 Interop DLL만으로는 대체할 수 없습니다.
+
+GT Designer3와 GOT Simulator는 GOT HMI까지 확인할 때 필요합니다. Unity–PLC 연동만 실행한다면 GOT Simulator는 생략할 수 있습니다.
+
+### 2. 저장소 클론
+
+PowerShell 또는 Git Bash에서 다음 명령을 실행합니다.
+
+\`\`\`powershell
+git clone --branch codex/plc-production-floor-hmi --single-branch https://github.com/Hu-tech-hub/PLC_VirtualFactory.git
+cd PLC_VirtualFactory
+\`\`\`
+
+이 저장소는 Unity 프로젝트 루트이므로 별도의 하위 Unity 폴더를 찾을 필요가 없습니다. 루트에 \`Assets\`, \`Packages\`, \`ProjectSettings\`가 보이면 올바르게 클론된 것입니다.
+
+### 3. Unity 프로젝트 등록
+
+1. Unity Hub를 실행합니다.
+2. \`Projects\`에서 \`Add\` 또는 \`Add project from disk\`를 선택합니다.
+3. 클론한 \`PLC_VirtualFactory\` 폴더 자체를 선택합니다.
+4. Unity Editor \`6000.5.6f1\`로 프로젝트를 엽니다. 해당 버전이 없다면 Unity Hub에서 먼저 설치합니다.
+5. 최초 실행 시 패키지와 Asset Import가 끝날 때까지 기다립니다.
+
+### 4. 64비트 Bridge 빌드
+
+Unity를 실행하기 전에 저장소 루트에서 PowerShell을 열고 다음 명령을 실행합니다. 이 과정은 \`Tools/PlcMxBridge.cs\`를 64비트 실행 파일로 컴파일하여 Unity가 실행할 위치에 배치합니다.
+
+\`\`\`powershell
+$projectRoot = (Get-Location).Path
+
+& "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /target:exe /platform:x64 /reference:System.Windows.Forms.dll /reference:"$projectRoot\Assets\Plugins\ActUtlType64Lib.dll" /out:"$projectRoot\Assets\Plugins\PlcMxBridge.exe" "$projectRoot\Tools\PlcMxBridge.cs"
+\`\`\`
+
+빌드 후 다음 파일이 생성되었는지 확인합니다.
+
+\`\`\`text
+Assets/Plugins/PlcMxBridge.exe
+\`\`\`
+
+Bridge는 \`[STAThread]\`, WinForms 메시지 루프 및 \`ActUtlType64Lib.dll\` 참조가 필요하므로 반드시 위와 같이 .NET Framework 64비트 컴파일러와 \`/platform:x64\`를 사용합니다.
+
+### 5. GX Works3와 GX Simulator3 실행
 
 1. GX Works3에서 [PLC 프로젝트](PLC/PLC_VirtualFactory.gx3)를 엽니다.
-2. PLC 프로그램을 GX Simulator3에 쓰고 시뮬레이션을 실행합니다.
-3. MX Component의 Logical Station 1이 해당 시뮬레이터 경로를 사용하도록 설정되어 있는지 확인합니다.
-4. 필요하면 GT Designer3에서 [GOT 프로젝트](GOT/PLC_VirtualFactory.GTX)를 열고 GOT Simulator를 실행합니다.
-5. Unity `6000.5.6f1`에서 저장소 루트를 프로젝트로 엽니다.
-6. Unity Play를 시작합니다. `PlcConnectionTest.cs`가 `Assets/Plugins/PlcMxBridge.exe`를 자동 실행합니다.
-7. Unity 연동 모드와 Auto 모드를 선택하고 Start 신호를 입력합니다.
-8. PLC의 검사 요청 이후 Unity에서 `O` 키로 OK, `N` 키로 NG 결과를 입력합니다.
-9. 배출 완료와 수량 증가 후 다음 제품이 자동으로 준비되는지 확인합니다.
+2. GX Simulator3를 시작합니다.
+3. PLC 프로그램과 파라미터를 시뮬레이터에 쓴 뒤 CPU를 \`RUN\` 상태로 전환합니다.
+4. Device/Buffer Memory Batch Monitor 등에서 \`D500\`, \`D0\`, \`D100\`, \`D101\`, \`M400\`을 등록하면 이후 Unity 연동에 따른 PLC 값 변화를 함께 확인할 수 있습니다.
 
-## Bridge 다시 빌드하기
+### 6. MX Component 통신 경로 확인
 
-`Tools/PlcMxBridge.cs`를 수정한 경우 기존 EXE는 자동으로 바뀌지 않습니다. 64비트 .NET Framework C# 컴파일러로 다시 빌드해야 합니다.
+MX Component 설치 시 함께 설치되는 **Communication Setup Utility**를 실행합니다.
 
-```powershell
-$projectRoot = "C:\path\to\PLC_VirtualFactory"
+1. Logical Station Number \`1\`을 선택하거나 새로 등록합니다.
+2. 통신 대상을 현재 실행 중인 GX Simulator3로 설정합니다.
+3. 설정을 저장합니다.
+4. \`Connection Test\`를 실행하여 Logical Station 1과 GX Simulator3의 연결이 성공하는지 확인합니다.
 
-& "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" `
-  /target:exe `
-  /platform:x64 `
-  /reference:System.Windows.Forms.dll `
-  /reference:"$projectRoot\Assets\Plugins\ActUtlType64Lib.dll" `
-  /out:"$projectRoot\Assets\Plugins\PlcMxBridge.exe" `
-  "$projectRoot\Tools\PlcMxBridge.cs"
-```
+GX Simulator3가 먼저 실행되어 있어야 연결 시험이 가능합니다. Bridge 코드도 Logical Station Number \`1\`을 사용하므로 다른 번호로 설정하면 Unity에서 PLC를 열 수 없습니다.
 
-Bridge에 필요한 조건은 다음과 같습니다.
+### 7. GOT HMI 확인(선택)
 
-- .NET Framework
-- x64 빌드
-- 진입점의 `[STAThread]`
-- `System.Windows.Forms.dll` 참조
-- `ActUtlType64Lib.dll` 참조
-- WinForms 메시지 루프에서 MX Component COM 객체 실행
+GOT 화면도 확인하려면 GX Simulator3가 실행 중인 상태에서 다음 순서로 진행합니다.
+
+1. GT Designer3에서 [GOT 프로젝트](GOT/PLC_VirtualFactory.GTX)를 엽니다.
+2. GOT Simulator를 실행합니다.
+3. GOT Simulator가 GX Simulator3의 R08CPU 프로젝트와 연결되는지 확인합니다.
+4. 메인 운전 화면, 알람 화면 및 PLC Device 값 변화를 확인합니다.
+
+GOT Simulator는 Unity–PLC 통신의 필수 구성 요소가 아니므로 필요할 때만 실행하면 됩니다.
+
+### 8. Unity–PLC 연결 확인
+
+1. Unity Editor에서 \`Game\` 탭을 연 뒤 상단의 Play 버튼을 누릅니다.
+2. \`PlcConnectionTest.cs\`가 \`Assets/Plugins/PlcMxBridge.exe\`를 자동 실행하고 MX Component Logical Station 1을 엽니다.
+3. Hierarchy에서 \`PLCCommunication Test\` GameObject를 선택합니다.
+4. Inspector의 \`PLC Status\`에서 \`Connected\`가 체크되고 \`Last Open Code\`가 \`0x00000000\`인지 확인합니다.
+5. GX Simulator3에서 \`M400\`을 \`TRUE\`로 강제 변경하여 PLC가 Unity 통신 입력을 사용하도록 전환합니다.
+
+> \`Connected\`는 Unity–Bridge–MX Component 통신 연결 상태이고, \`M400\`은 PLC의 **Unity 연동 입력 선택**입니다. 두 항목은 역할이 다릅니다.
+
+연결되지 않으면 Unity Console의 \`[PLC TEST]\` 및 \`[BRIDGE]\` 로그, Inspector의 \`Last Open Code\`, 그리고 Communication Setup Utility의 Logical Station 1 설정부터 확인합니다.
+
+### 9. 자동 공정 시연
+
+연결 확인 후 Unity의 3D 운전 조작반을 사용합니다.
+
+1. Auto 모드를 선택합니다.
+2. Start를 입력합니다.
+3. 제품이 검사 위치까지 이송되어 정지하는지 확인합니다.
+4. 검사 요청 후 조작반에서 OK 또는 NG 결과를 입력합니다.
+5. 결과에 따라 OK 직진 배출 또는 NG 실린더 배출이 수행되는지 확인합니다.
+6. 생산수량이 증가하고 다음 제품이 자동으로 준비되는지 확인합니다.
+
+키보드 \`O\`/\`N\` 입력은 중간 개발 단계의 시험 방식이므로 최종 실행 절차에서는 사용하지 않습니다. 위의 [자동 공정 단계별 시연](#자동-공정-단계별-시연) GIF를 따라 조작하고, GX Simulator3에서 \`D500\`, \`D0\`, \`D100\`, \`D101\`, \`D10\`~\`D12\` 값이 함께 변하는지 확인하면 전체 폐루프 동작을 검증할 수 있습니다.
 
 ## 저장소 구조
 
