@@ -79,10 +79,10 @@ flowchart TD
 Unity는 MX Component COM 객체를 직접 생성하지 않습니다. `PlcConnectionTest.cs`가 외부 프로세스로 Bridge를 실행하고, 표준 입력과 표준 출력으로 명령과 결과를 교환합니다.
 
 ```text
-Tools/PlcMxBridge.cs
-        │ csc.exe /platform:x64
+Tools/PlcMxBridge.cs (Bridge 원본 소스, 수정 시에만 재빌드)
+        │
         ▼
-Assets/Plugins/PlcMxBridge.exe
+Assets/Plugins/PlcMxBridge.exe (저장소에 포함)
         │ Process.Start()
         ▼
 Assets/Scripts/PLC/PlcConnectionTest.cs
@@ -215,7 +215,7 @@ GT Designer3 원본 프로젝트는 [GOT/PLC_VirtualFactory.GTX](GOT/PLC_Virtual
 | GT Designer3 / GOT Simulator | GT Designer3 `1.256S` | GOT HMI 편집 및 선택적 시뮬레이션 |
 | MX Component | `5.TRIAL (SW5DND-ACT-E)` | GX Simulator3와 64비트 Bridge 사이의 통신 |
 | Unity Hub / Unity Editor | Unity `6000.5.6f1` | Unity 가상 설비 실행 |
-| .NET Framework | 4.x | `PlcMxBridge.exe` x64 컴파일 및 실행 |
+| .NET Framework | 4.x | 저장소에 포함된 `PlcMxBridge.exe` 실행 |
 | Git | 최신 버전 | 저장소 클론 |
 
 > 위 표는 이 프로젝트에서 검증한 버전입니다. MX Component는 반드시 Windows에 설치되어 COM 서버가 등록되어 있어야 하며, 저장소의 Interop DLL만으로는 대체할 수 없습니다.
@@ -227,7 +227,7 @@ GT Designer3와 GOT Simulator는 GOT HMI까지 확인할 때 필요합니다. Un
 PowerShell 또는 Git Bash에서 다음 명령을 실행합니다.
 
 ```powershell
-git clone --branch codex/plc-production-floor-hmi --single-branch https://github.com/Hu-tech-hub/PLC_VirtualFactory.git
+git clone https://github.com/Hu-tech-hub/PLC_VirtualFactory.git
 cd PLC_VirtualFactory
 ```
 
@@ -241,23 +241,17 @@ cd PLC_VirtualFactory
 4. Unity Editor `6000.5.6f1`로 프로젝트를 엽니다. 해당 버전이 없다면 Unity Hub에서 먼저 설치합니다.
 5. 최초 실행 시 패키지와 Asset Import가 끝날 때까지 기다립니다.
 
-### 4. 64비트 Bridge 빌드
+### 4. Bridge 실행 파일 확인
 
-Unity에서 Play를 시작하기 전에 저장소 루트에서 PowerShell을 열고 다음 명령을 실행합니다. 이 과정은 `Tools/PlcMxBridge.cs`를 64비트 실행 파일로 컴파일하여 Unity가 실행할 위치에 배치합니다.
-
-```powershell
-$projectRoot = (Get-Location).Path
-
-& "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /target:exe /platform:x64 /reference:System.Windows.Forms.dll /reference:"$projectRoot\Assets\Plugins\ActUtlType64Lib.dll" /out:"$projectRoot\Assets\Plugins\PlcMxBridge.exe" "$projectRoot\Tools\PlcMxBridge.cs"
-```
-
-빌드 후 다음 파일이 생성되었는지 확인합니다.
+64비트 Bridge 실행 파일은 저장소의 다음 경로에 이미 포함되어 있습니다.
 
 ```text
 Assets/Plugins/PlcMxBridge.exe
 ```
 
-Bridge는 `[STAThread]`, WinForms 메시지 루프 및 `ActUtlType64Lib.dll` 참조가 필요하므로 반드시 위와 같이 .NET Framework 64비트 컴파일러와 `/platform:x64`를 사용합니다.
+따라서 저장소를 클론하여 실행할 때 `Tools/PlcMxBridge.cs`를 다시 컴파일할 필요가 없습니다. Unity Play를 시작하면 `PlcConnectionTest.cs`가 이 EXE를 자동 실행합니다.
+
+`Tools/PlcMxBridge.cs`는 Bridge의 원본 소스이며, Bridge 코드를 수정한 경우에만 .NET Framework 64비트 컴파일러와 `/platform:x64` 옵션으로 EXE를 다시 빌드하면 됩니다.
 
 ### 5. GX Works3와 GX Simulator3 실행
 
