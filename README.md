@@ -191,7 +191,6 @@ GX Works3 원본 프로젝트는 [PLC/PLC_VirtualFactory.gx3](PLC/PLC_VirtualFac
 | `D12` | NG 수량 |
 | `D30` | 검사 결과 코드: 1=OK, 2=NG |
 
-`PlcConnectionTest.cs`는 요청 큐를 사용해 한 번에 하나의 Read·Write 명령만 Bridge로 전송합니다. `Update()`에서 COM 통신을 직접 수행하지 않으며, Bridge 출력은 별도 이벤트에서 큐에 넣고 Unity 메인 스레드에서 반영합니다. `D0`과 `D101`은 필요한 비트만 변경하는 마스크 쓰기를 사용해 다른 신호를 보존합니다.
 
 ## GOT 화면
 
@@ -332,17 +331,6 @@ PLC_VirtualFactory/
       ├─ unity/                # 전체 설비·공정 흐름·3D 조작반 이미지
       └─ got/                  # GOT 운전·알람·Simulator 화면
 ```
-
-## 문제 해결 핵심
-
-Unity에서 MX Component를 직접 호출하는 과정에서는 다음 문제가 발생했습니다.
-
-- 32비트 COM 객체와 64비트 Unity Editor 간 비트 수 불일치
-- .NET용 래퍼 사용 시 `Open()` 또는 Device Read 오류
-- 콘솔 STA 스레드만 사용했을 때 `Open()`이 반환되지 않는 현상
-- Unity 메인 스레드에서 동기 통신할 경우 발생할 수 있는 프레임 정지
-
-Mitsubishi 공식 C# 샘플이 `[STAThread]`와 WinForms 메시지 루프에서 `ActUtlType64Class`를 생성하는 구조임을 확인한 뒤, 동일 조건을 외부 64비트 Bridge에 적용했습니다. Unity는 Bridge 프로세스와 비동기적으로 통신하므로 MX Component COM 객체를 직접 다루지 않습니다.
 
 ## 상세 개발 기록
 
