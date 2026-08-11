@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -10,7 +11,40 @@ using Debug = UnityEngine.Debug;
 
 public sealed class PlcConnectionTest : MonoBehaviour
 {
-    private const float ReadIntervalSeconds = 0.2f;
+    private const float PollRequestIntervalSeconds = 0.1f;
+    private const int RequestFailureCode = unchecked((int)0x80004005);
+
+    private static readonly string[] PollSequence =
+    {
+        "D100", "M400", "D100", "M30", "D100", "M20",
+        "D100", "M21", "D100", "M200", "D100", "D600", "D100", "D500",
+        "D100", "D10", "D100", "D11", "D100", "D12",
+        "D100", "D0", "D100", "D101", "D100", "M13"
+    };
+
+    private enum RequestKind
+    {
+        Read,
+        Write
+    }
+
+    private sealed class PlcRequest
+    {
+        public long Id;
+        public RequestKind Kind;
+        public string Device;
+        public int Value;
+        public int Mask;
+        public int EnabledBits;
+        public bool IsD0MaskedWrite;
+        public bool IsD101MaskedWrite;
+    }
+
+    private struct CachedDeviceValue
+    {
+        public int Value;
+        public float UpdatedAt;
+    }
 
     private static PlcConnectionTest activeInstance;
 
@@ -18,24 +52,31 @@ public sealed class PlcConnectionTest : MonoBehaviour
     [SerializeField] private bool connected;
     [SerializeField] private int d100Value;
     [SerializeField] private int d0Word;
+    [SerializeField] private int d101Word;
     [SerializeField] private int d101LastWritten;
+    [SerializeField] private bool d0Ready;
+    [SerializeField] private bool d101Ready;
+    [SerializeField] private float lastDataUpdateRealtime = -1f;
     [SerializeField] private string lastOpenCode = "--------";
     [SerializeField] private string lastReadCode = "--------";
     [SerializeField] private string lastWriteCode = "--------";
     [SerializeField] private string lastBridgeDiagnostic = "--------";
 
     private readonly ConcurrentQueue<string> responseQueue = new ConcurrentQueue<string>();
-    private Process bridgeProcess;
+    private readonly LinkedList<PlcRequest> requestQueue = new LinkedList<PlcRequest>();
+    private readonly Dictionary<string, CachedDeviceValue> deviceCache =
+        new Dictionary<string, CachedDeviceValue>(StringComparer.OrdinalIgnoreCase);
     private readonly ManualResetEventSlim closeResponseReceived = new ManualResetEventSlim(false);
     private readonly ManualResetEventSlim bridgeProcessExited = new ManualResetEventSlim(false);
-    private Coroutine readCoroutine;
-    private bool readPending;
+
+    private Process bridgeProcess;
+    private Coroutine pollCoroutine;
+    private PlcRequest inFlightRequest;
     private int shutdownStarted;
-    private bool hasReadValue;
-    private int pendingD101Value;
+    private int pollIndex;
+    private long nextRequestId;
     private string closeResponseLine;
-    private bool d0Ready;
-    private bool d0ReadPending;
+
     private bool d0WriteInProgress;
     private int d0InFlightValue;
     private bool d0Queued;
@@ -45,15 +86,28 @@ public sealed class PlcConnectionTest : MonoBehaviour
     public int D100Value => d100Value;
     public int D0Word => d0Word;
     public bool D0Ready => d0Ready;
+    public int D101Word => d101Word;
+    public bool D101Ready => d101Ready;
     public int D101LastWritten => d101LastWritten;
+    public float LastDataUpdateRealtime => lastDataUpdateRealtime;
     public string LastBridgeDiagnostic => lastBridgeDiagnostic;
+    public int PendingRequestCount => requestQueue.Count + (inFlightRequest != null ? 1 : 0);
+    public bool HasPendingD0Writes => HasPendingD0WriteRequest();
+
     public event Action<int, int> D0WriteCompleted;
+    public event Action<long, int, int> D0WriteRequestCompleted;
+    public event Action<long, int, int> D101WriteCompleted;
 
     private void Awake()
     {
-        // Inspector values are diagnostic only; connection readiness must come from this Play session.
+        // Inspector fields are diagnostics only; readiness must be earned in this Play session.
         connected = false;
         d0Ready = false;
+        d101Ready = false;
+        lastDataUpdateRealtime = -1f;
+        deviceCache.Clear();
+        requestQueue.Clear();
+        inFlightRequest = null;
 
         if (activeInstance != null && activeInstance != this)
         {
@@ -67,12 +121,10 @@ public sealed class PlcConnectionTest : MonoBehaviour
 
     private void Start()
     {
-        if (activeInstance != this)
+        if (activeInstance == this)
         {
-            return;
+            StartBridge();
         }
-
-        StartBridge();
     }
 
     private void Update()
@@ -88,6 +140,32 @@ public sealed class PlcConnectionTest : MonoBehaviour
         }
     }
 
+    public static int CalculateMaskedWord(int currentWord, int mask, int enabledBits)
+    {
+        mask &= 0xFFFF;
+        return ((currentWord & ~mask) | (enabledBits & mask)) & 0xFFFF;
+    }
+
+    public bool TryGetCachedDevice(string device, out int value, out float ageSeconds)
+    {
+        if (deviceCache.TryGetValue(device, out CachedDeviceValue cached))
+        {
+            value = cached.Value;
+            ageSeconds = Mathf.Max(0f, Time.realtimeSinceStartup - cached.UpdatedAt);
+            return true;
+        }
+
+        value = 0;
+        ageSeconds = float.PositiveInfinity;
+        return false;
+    }
+
+    public bool IsDeviceStale(string device, float staleAfterSeconds)
+    {
+        return !TryGetCachedDevice(device, out _, out float ageSeconds) ||
+               ageSeconds > Mathf.Max(0f, staleAfterSeconds);
+    }
+
     public void WriteDevice(string device, int value)
     {
         if (!connected)
@@ -98,10 +176,11 @@ public sealed class PlcConnectionTest : MonoBehaviour
 
         if (device.Equals("D101", StringComparison.OrdinalIgnoreCase))
         {
-            pendingD101Value = value;
+            TrySetD101MaskedBits(0xFFFF, value, false, out _);
+            return;
         }
 
-        SendCommand($"WRITE {device} {value.ToString(CultureInfo.InvariantCulture)}");
+        EnqueueWrite(device, value & 0xFFFF, false);
     }
 
     public bool SetD0Bit(int bitIndex, bool enabled)
@@ -122,14 +201,12 @@ public sealed class PlcConnectionTest : MonoBehaviour
             return false;
         }
 
-        mask &= 0xFFFF;
         int baseValue = d0Queued
             ? d0QueuedValue
             : d0WriteInProgress
                 ? d0InFlightValue
                 : d0Word;
-        int newValue = ((baseValue & ~mask) | (enabledBits & mask)) & 0xFFFF;
-
+        int newValue = CalculateMaskedWord(baseValue, mask, enabledBits);
         if (newValue == baseValue)
         {
             return false;
@@ -148,11 +225,72 @@ public sealed class PlcConnectionTest : MonoBehaviour
         return true;
     }
 
+    public bool TrySetD0MaskedBitsTracked(
+        int mask,
+        int enabledBits,
+        out long requestId)
+    {
+        requestId = 0;
+        mask &= 0xFFFF;
+        if (!connected || !d0Ready || mask == 0)
+        {
+            return false;
+        }
+
+        var request = new PlcRequest
+        {
+            Id = ++nextRequestId,
+            Kind = RequestKind.Write,
+            Device = "D0",
+            Mask = mask,
+            EnabledBits = enabledBits & mask,
+            IsD0MaskedWrite = true
+        };
+
+        requestId = request.Id;
+        // RESET writes must stay behind every previously queued process write.
+        EnqueueRequest(request, false);
+        return true;
+    }
+
+    public bool SetD101MaskedBits(int mask, int enabledBits)
+    {
+        return TrySetD101MaskedBits(mask, enabledBits, false, out _);
+    }
+
+    public bool TrySetD101MaskedBits(
+        int mask,
+        int enabledBits,
+        bool highPriority,
+        out long requestId)
+    {
+        requestId = 0;
+        mask &= 0xFFFF;
+        if (!connected || !d101Ready || mask == 0)
+        {
+            return false;
+        }
+
+        var request = new PlcRequest
+        {
+            Id = ++nextRequestId,
+            Kind = RequestKind.Write,
+            Device = "D101",
+            Mask = mask,
+            EnabledBits = enabledBits & mask,
+            IsD101MaskedWrite = true
+        };
+
+        requestId = request.Id;
+        EnqueueRequest(request, highPriority);
+        return true;
+    }
+
     private void StartD0Write(int value)
     {
         d0WriteInProgress = true;
         d0InFlightValue = value & 0xFFFF;
-        WriteDevice("D0", d0InFlightValue);
+        EnqueueWrite("D0", d0InFlightValue, true);
     }
 
     private void TryStartQueuedD0Write()
@@ -185,7 +323,6 @@ public sealed class PlcConnectionTest : MonoBehaviour
         }
 
         string bridgePath = Path.Combine(Application.dataPath, "Plugins", "PlcMxBridge.exe");
-
         try
         {
             bridgeProcess = new Process
@@ -222,20 +359,138 @@ public sealed class PlcConnectionTest : MonoBehaviour
         }
     }
 
-    private IEnumerator PollD100()
+    private IEnumerator PollDevices()
     {
-        WaitForSeconds wait = new WaitForSeconds(ReadIntervalSeconds);
-
+        var wait = new WaitForSecondsRealtime(PollRequestIntervalSeconds);
         while (connected && Volatile.Read(ref shutdownStarted) == 0)
         {
-            if (!readPending)
-            {
-                readPending = true;
-                SendCommand("READ D100");
-            }
-
+            string device = PollSequence[pollIndex];
+            pollIndex = (pollIndex + 1) % PollSequence.Length;
+            EnqueueRead(device, false);
             yield return wait;
         }
+    }
+
+    private void EnqueueRead(string device, bool highPriority)
+    {
+        if (!connected || HasPendingRead(device) ||
+            (device.Equals("D0", StringComparison.OrdinalIgnoreCase) && d0WriteInProgress))
+        {
+            return;
+        }
+
+        EnqueueRequest(new PlcRequest
+        {
+            Id = ++nextRequestId,
+            Kind = RequestKind.Read,
+            Device = device
+        }, highPriority);
+    }
+
+    private void EnqueueWrite(string device, int value, bool highPriority)
+    {
+        if (!connected)
+        {
+            return;
+        }
+
+        EnqueueRequest(new PlcRequest
+        {
+            Id = ++nextRequestId,
+            Kind = RequestKind.Write,
+            Device = device,
+            Value = value & 0xFFFF
+        }, highPriority);
+    }
+
+    private void EnqueueRequest(PlcRequest request, bool highPriority)
+    {
+        if (highPriority)
+        {
+            requestQueue.AddFirst(request);
+        }
+        else
+        {
+            requestQueue.AddLast(request);
+        }
+
+        TryDispatchNextRequest();
+    }
+
+    private bool HasPendingRead(string device)
+    {
+        if (inFlightRequest != null && inFlightRequest.Kind == RequestKind.Read &&
+            inFlightRequest.Device.Equals(device, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        foreach (PlcRequest request in requestQueue)
+        {
+            if (request.Kind == RequestKind.Read &&
+                request.Device.Equals(device, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool HasPendingD0WriteRequest()
+    {
+        if (d0WriteInProgress || d0Queued)
+        {
+            return true;
+        }
+
+        if (inFlightRequest != null && inFlightRequest.Kind == RequestKind.Write &&
+            inFlightRequest.Device.Equals("D0", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        foreach (PlcRequest request in requestQueue)
+        {
+            if (request.Kind == RequestKind.Write &&
+                request.Device.Equals("D0", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void TryDispatchNextRequest()
+    {
+        if (!connected || inFlightRequest != null || requestQueue.Count == 0)
+        {
+            return;
+        }
+
+        inFlightRequest = requestQueue.First.Value;
+        requestQueue.RemoveFirst();
+
+        if (inFlightRequest.IsD0MaskedWrite)
+        {
+            inFlightRequest.Value = CalculateMaskedWord(
+                d0Word,
+                inFlightRequest.Mask,
+                inFlightRequest.EnabledBits);
+        }
+        else if (inFlightRequest.IsD101MaskedWrite)
+        {
+            inFlightRequest.Value = CalculateMaskedWord(
+                d101Word,
+                inFlightRequest.Mask,
+                inFlightRequest.EnabledBits);
+        }
+
+        string command = inFlightRequest.Kind == RequestKind.Read
+            ? $"READ {inFlightRequest.Device}"
+            : $"WRITE {inFlightRequest.Device} {inFlightRequest.Value.ToString(CultureInfo.InvariantCulture)}";
+        SendCommand(command);
     }
 
     private void OnBridgeOutput(object sender, DataReceivedEventArgs eventArgs)
@@ -330,16 +585,16 @@ public sealed class PlcConnectionTest : MonoBehaviour
 
         connected = true;
         Debug.Log($"[PLC TEST] Connected. Open Code = {lastOpenCode}");
-        d0ReadPending = true;
-        SendCommand("READ D0");
-        readCoroutine = StartCoroutine(PollD100());
+        EnqueueRead("D0", true);
+        EnqueueRead("D101", true);
+        pollCoroutine = StartCoroutine(PollDevices());
     }
 
     private void HandleRead(string[] parts)
     {
-        if (parts.Length < 4)
+        if (parts.Length < 4 || !ResponseMatches(RequestKind.Read, parts[1]))
         {
-            SetDisconnected("Malformed Read response.");
+            SetDisconnected("Malformed or out-of-order Read response.");
             return;
         }
 
@@ -351,76 +606,110 @@ public sealed class PlcConnectionTest : MonoBehaviour
             return;
         }
 
-        int newValue = int.Parse(parts[3], CultureInfo.InvariantCulture);
+        int newValue = int.Parse(parts[3], CultureInfo.InvariantCulture) & 0xFFFF;
+        UpdateDeviceCache(parts[1], newValue);
         if (parts[1].Equals("D0", StringComparison.OrdinalIgnoreCase))
         {
-            d0ReadPending = false;
-            d0Word = newValue & 0xFFFF;
-            d0WriteInProgress = false;
-            d0Queued = false;
+            d0Word = newValue;
             d0Ready = true;
-            Debug.Log($"[PLC INPUT] D0 initialized: value={d0Word}");
-            return;
         }
-
-        if (!parts[1].Equals("D100", StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-
-        readPending = false;
-        if (!hasReadValue || d100Value != newValue)
+        else if (parts[1].Equals("D100", StringComparison.OrdinalIgnoreCase))
         {
             d100Value = newValue;
-            hasReadValue = true;
-            Debug.Log($"[PLC D100] {DateTime.Now:HH:mm:ss.fff} Value changed: {parts[1]} = {d100Value}, " +
-                      $"frame={Time.frameCount}, thread={Thread.CurrentThread.ManagedThreadId}, Code={lastReadCode}");
         }
+        else if (parts[1].Equals("D101", StringComparison.OrdinalIgnoreCase))
+        {
+            d101Word = newValue;
+            d101Ready = true;
+        }
+
+        CompleteInFlightRequest();
     }
 
     private void HandleWrite(string[] parts)
     {
-        if (parts.Length < 3)
+        if (parts.Length < 3 || !ResponseMatches(RequestKind.Write, parts[1]))
         {
-            SetDisconnected("Malformed Write response.");
+            SetDisconnected("Malformed or out-of-order Write response.");
             return;
         }
 
+        PlcRequest completedRequest = inFlightRequest;
         int result = ParseHex(parts[2]);
         lastWriteCode = $"0x{result:X8}";
-        bool isD0Write = parts[1].Equals("D0", StringComparison.OrdinalIgnoreCase);
-        int completedD0Value = d0InFlightValue & 0xFFFF;
-        if (isD0Write)
-        {
-            Debug.Log($"[PLC INPUT] WRITE D0 result: {lastWriteCode}");
-        }
+        bool isD0Write = completedRequest.Device.Equals("D0", StringComparison.OrdinalIgnoreCase);
+        bool isD101Write = completedRequest.Device.Equals("D101", StringComparison.OrdinalIgnoreCase);
 
         if (result != 0)
         {
             if (isD0Write)
             {
-                D0WriteCompleted?.Invoke(result, completedD0Value);
+                D0WriteCompleted?.Invoke(result, completedRequest.Value);
+                D0WriteRequestCompleted?.Invoke(
+                    completedRequest.Id,
+                    result,
+                    completedRequest.Value);
                 d0WriteInProgress = false;
                 d0Queued = false;
             }
+            else if (isD101Write)
+            {
+                D101WriteCompleted?.Invoke(completedRequest.Id, result, completedRequest.Value);
+            }
 
+            inFlightRequest = null;
             SetDisconnected($"Write failed. Device = {parts[1]}, Code = {lastWriteCode}");
             return;
         }
 
-        if (parts[1].Equals("D101", StringComparison.OrdinalIgnoreCase))
+        UpdateDeviceCache(completedRequest.Device, completedRequest.Value);
+        if (isD0Write)
         {
-            d101LastWritten = pendingD101Value;
-        }
-        else if (isD0Write)
-        {
-            d0Word = completedD0Value;
+            d0Word = completedRequest.Value;
             d0WriteInProgress = false;
             D0WriteCompleted?.Invoke(result, d0Word);
-            TryStartQueuedD0Write();
+            D0WriteRequestCompleted?.Invoke(
+                completedRequest.Id,
+                result,
+                d0Word);
+        }
+        else if (isD101Write)
+        {
+            d101Word = completedRequest.Value;
+            d101LastWritten = completedRequest.Value;
+            d101Ready = true;
+            D101WriteCompleted?.Invoke(completedRequest.Id, result, completedRequest.Value);
         }
 
-        Debug.Log($"[PLC TEST] Write succeeded. Device = {parts[1]}, Code = {lastWriteCode}");
+        Debug.Log($"[PLC TEST] Write succeeded. Device = {parts[1]}, value={completedRequest.Value}, Code = {lastWriteCode}");
+        CompleteInFlightRequest();
+        if (isD0Write)
+        {
+            TryStartQueuedD0Write();
+        }
+    }
+
+    private bool ResponseMatches(RequestKind kind, string device)
+    {
+        return inFlightRequest != null && inFlightRequest.Kind == kind &&
+               inFlightRequest.Device.Equals(device, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void CompleteInFlightRequest()
+    {
+        inFlightRequest = null;
+        TryDispatchNextRequest();
+    }
+
+    private void UpdateDeviceCache(string device, int value)
+    {
+        float now = Time.realtimeSinceStartup;
+        deviceCache[device] = new CachedDeviceValue
+        {
+            Value = value & 0xFFFF,
+            UpdatedAt = now
+        };
+        lastDataUpdateRealtime = now;
     }
 
     private void SendCommand(string command)
@@ -449,18 +738,62 @@ public sealed class PlcConnectionTest : MonoBehaviour
         }
 
         connected = false;
-        readPending = false;
-        d0ReadPending = false;
         d0Ready = false;
+        d101Ready = false;
         d0WriteInProgress = false;
         d0Queued = false;
-        if (readCoroutine != null)
+        FailPendingWriteRequests();
+        requestQueue.Clear();
+        inFlightRequest = null;
+
+        if (pollCoroutine != null)
         {
-            StopCoroutine(readCoroutine);
-            readCoroutine = null;
+            StopCoroutine(pollCoroutine);
+            pollCoroutine = null;
         }
 
         Debug.LogError($"[PLC TEST] Disconnected. {reason}");
+    }
+
+    private void FailPendingWriteRequests()
+    {
+        if (inFlightRequest != null && inFlightRequest.Kind == RequestKind.Write &&
+            inFlightRequest.Device.Equals("D0", StringComparison.OrdinalIgnoreCase))
+        {
+            D0WriteCompleted?.Invoke(RequestFailureCode, inFlightRequest.Value);
+            D0WriteRequestCompleted?.Invoke(
+                inFlightRequest.Id,
+                RequestFailureCode,
+                inFlightRequest.Value);
+        }
+
+        if (inFlightRequest != null && inFlightRequest.Kind == RequestKind.Write &&
+            inFlightRequest.Device.Equals("D101", StringComparison.OrdinalIgnoreCase))
+        {
+            D101WriteCompleted?.Invoke(inFlightRequest.Id, RequestFailureCode, inFlightRequest.Value);
+        }
+
+        foreach (PlcRequest request in requestQueue)
+        {
+            if (request.Kind != RequestKind.Write)
+            {
+                continue;
+            }
+
+            if (request.Device.Equals("D0", StringComparison.OrdinalIgnoreCase))
+            {
+                D0WriteCompleted?.Invoke(RequestFailureCode, request.Value);
+                D0WriteRequestCompleted?.Invoke(
+                    request.Id,
+                    RequestFailureCode,
+                    request.Value);
+            }
+            else if (
+                request.Device.Equals("D101", StringComparison.OrdinalIgnoreCase))
+            {
+                D101WriteCompleted?.Invoke(request.Id, RequestFailureCode, request.Value);
+            }
+        }
     }
 
     private void OnApplicationQuit()
@@ -471,7 +804,6 @@ public sealed class PlcConnectionTest : MonoBehaviour
     private void OnDestroy()
     {
         ShutdownBridge();
-
         if (activeInstance == this)
         {
             activeInstance = null;
@@ -487,11 +819,10 @@ public sealed class PlcConnectionTest : MonoBehaviour
 
         Debug.Log("[PLC BRIDGE] Shutdown started");
         connected = false;
-
-        if (readCoroutine != null)
+        if (pollCoroutine != null)
         {
-            StopCoroutine(readCoroutine);
-            readCoroutine = null;
+            StopCoroutine(pollCoroutine);
+            pollCoroutine = null;
         }
 
         if (bridgeProcess == null)
@@ -513,7 +844,6 @@ public sealed class PlcConnectionTest : MonoBehaviour
                     closeResponseReceived.WaitHandle,
                     bridgeProcessExited.WaitHandle
                 };
-
                 Stopwatch shutdownTimer = Stopwatch.StartNew();
                 int signal = WaitHandle.WaitAny(shutdownSignals, 5000);
                 if (signal == WaitHandle.WaitTimeout)
@@ -522,11 +852,6 @@ public sealed class PlcConnectionTest : MonoBehaviour
                 }
                 else
                 {
-                    if (closeResponseReceived.IsSet)
-                    {
-                        Debug.Log("[PLC BRIDGE] CLOSE acknowledged");
-                    }
-
                     int remainingMilliseconds = Math.Max(0, 5000 - (int)shutdownTimer.ElapsedMilliseconds);
                     if (!bridgeProcess.HasExited && remainingMilliseconds > 0)
                     {
@@ -543,15 +868,12 @@ public sealed class PlcConnectionTest : MonoBehaviour
 
                 if (bridgeProcess.HasExited)
                 {
-                    // Drain redirected output before detaching handlers and disposing wait handles.
                     bridgeProcess.WaitForExit();
                     Debug.Log("[PLC BRIDGE] Process exited");
                     if (closeResponseReceived.IsSet)
                     {
                         Debug.Log($"[PLC TEST] {closeResponseLine}");
                     }
-
-                    Debug.Log("[PLC BRIDGE] Mutex released");
                 }
             }
         }

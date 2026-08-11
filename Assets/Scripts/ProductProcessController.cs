@@ -59,6 +59,17 @@ public sealed class ProductProcessController : MonoBehaviour
         plcIntegrationMode = enabled;
     }
 
+    public void ResetForPlcSafety()
+    {
+        resultSelected = false;
+        completionLogged = false;
+        currentState = ProcessState.Waiting;
+        if (productMover != null)
+        {
+            productMover.ResetMovementState();
+        }
+    }
+
     private void Update()
     {
         HandleInput();
